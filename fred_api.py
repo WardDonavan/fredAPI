@@ -26,8 +26,8 @@ obs_endpoint = 'series/observations'
 # Assign parameters
 series_id = 'CPIAUCSL'
 start_date = '2000-01-01'
-end_date = '2023-06-30'
-ts_frequency = 'q'
+end_date = '2025-08-31'
+ts_frequency = 'm'
 ts_units = 'pc1'
 
 obs_params = {
