@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Fetch all FRED categories and their children recursively.
+Author : Your Name
+"""
+
+import requests
+import pandas as pd
+from typing import List, Dict
+
+# ----------------------------------------------------------------------
+# 1.  Configuration ----------------------------------------------------
+# ----------------------------------------------------------------------
+API_KEY = "7d180633deb64279c43189df49bd95e0"  # <-- replace with your key
+BASE_URL = "https://api.stlouisfed.org/fred/"
+FILE_TYPE = "json"
+
+# ----------------------------------------------------------------------
+# 2.  Helper: request a single category -------------------------------
+# ----------------------------------------------------------------------
+def _fetch_category(cat_id: int) -> Dict:
+    """
+    Return the raw JSON dict for a single category.
+    Raises RuntimeError if the API returns an error status code.
+    """
+    params = {
+        "api_key": API_KEY,
+        "file_type": FILE_TYPE,
+        "category_id": cat_id
+    }
+    resp = requests.get(BASE_URL + "category", params=params)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Failed to fetch category {cat_id}: "
+            f"{resp.status_code} – {resp.text}"
+        )
+    return resp.json()
+
+# ----------------------------------------------------------------------
+# 3.  Helper: fetch children of a given category --------------------
+# ----------------------------------------------------------------------
+def _fetch_children(cat_id: int) -> List[int]:
+    """
+    Return a list of child category ids for the supplied parent id.
+    """
+    params = {
+        "api_key": API_KEY,
+        "file_type": FILE_TYPE,
+        "category_id": cat_id
+    }
+    resp = requests.get(BASE_URL + "category/children", params=params)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Failed to fetch children of {cat_id}: "
+            f"{resp.status_code} – {resp.text}"
+        )
+    data = resp.json()
+    return [child["id"] for child in data.get("categories", [])]
+
+# ----------------------------------------------------------------------
+# 4.  Recursive traversal ---------------------------------------------
+# ----------------------------------------------------------------------
+def _traverse_category(cat_id: int,
+                       parent_id: int = 0,
+                       depth: int = 0) -> List[Dict]:
+    """
+    Recursively walk the category tree starting at `cat_id`.
+    Returns a list of dicts, one per category (including children).
+    """
+    # Fetch the current category's metadata
+    cat_json = _fetch_category(cat_id)
+
+    # Build the record that will end up in the DataFrame
+    record = {
+        "category_id": cat_json["id"],
+        "parent_category_id": parent_id,
+        "name": cat_json.get("name"),
+        "description": cat_json.get("description"),
+        "url": cat_json.get("url"),
+        "depth": depth
+    }
+
+    # Recurse into children
+    children = _fetch_children(cat_id)
+    all_records = [record]
+    for child_id in children:
+        all_records.extend(_traverse_category(child_id,
+                                             parent_id=cat_id,
+                                             depth=depth + 1))
+    return all_records
+
+# ----------------------------------------------------------------------
+# 5.  Public API -------------------------------------------------------
+# ----------------------------------------------------------------------
+def fetch_all_fred_categories(root_id: int = 0) -> pd.DataFrame:
+    """
+    Pull every category and descendant from FRED into a tidy DataFrame.
+
+    Parameters
+    ----------
+    root_id : int, default=0
+        The id of the category you want to start at. 0 is the root,
+        which gives you *all* categories.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per category with columns described above.
+    """
+    records = _traverse_category(root_id)
+    df = pd.DataFrame(records)
+
+    # Optional: sort by depth then by id for easier reading
+    df.sort_values(["depth", "category_id"], inplace=True)
+    return df
+
+# ----------------------------------------------------------------------
+# 6.  Demo -------------------------------------------------------------
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    print("Fetching FRED categories – this may take a minute…")
+    categories_df = fetch_all_fred_categories()
+
+    # Quick sanity check
+    print(f"Total categories fetched: {len(categories_df)}")
+    print("\nSample rows:")
+    print(categories_df.head())
+
+    # If you want to save the data:
+    # categories_df.to_csv("fred_categories.csv", index=False)

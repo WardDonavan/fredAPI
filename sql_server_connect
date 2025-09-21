@@ -1,0 +1,44 @@
+# -*- coding: utf-8 -*-
+"""
+Connect to a local/remote SQL Server instance using Windows Authentication.
+"""
+
+import pyodbc
+
+# ------------------------------------------------------------------
+# 1️⃣  Connection details – replace only the server and database names.
+#     The rest (UID / PWD) is *not* needed when you use a trusted connection.
+# ------------------------------------------------------------------
+server   = r'Don_PC\SQLEXPRESS'   # note: raw string or double backslash
+database = 'Main'
+
+# ------------------------------------------------------------------
+# 2️⃣  Build the ODBC connection string.
+#
+#     - DRIVER          : The ODBC driver for SQL Server (change if you have a different one).
+#     - SERVER          : Name of the instance, e.g. "MyServer\SQLEXPRESS".
+#     - DATABASE        : Target database.
+#     - Trusted_Connection=Yes  → use Windows auth (NTLM) instead of SQL login.
+# ------------------------------------------------------------------
+conn_str = (
+    r'DRIVER={ODBC Driver 17 for SQL Server};'
+    f'SERVER={server};'
+    f'DATABASE={database};'
+    'Trusted_Connection=yes;'
+)
+
+# ------------------------------------------------------------------
+# 3️⃣  Try the connection and run a simple query.
+# ------------------------------------------------------------------
+try:
+    conn = pyodbc.connect(conn_str)
+    print("✅ Connection successful!")
+
+    cursor = conn.cursor()
+    cursor.execute("SELECT @@VERSION;")
+    row = cursor.fetchone()
+    print(f"SQL Server version: {row[0]}")
+    cursor.close()
+
+finally:
+    conn.close()
