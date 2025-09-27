@@ -12,6 +12,7 @@ and plots the result.
 # ------------------------------------------------------------------
 import requests
 import pandas as pd
+from datetime import datetime
 
 # Optional: use numpy for quick array operations (not required)
 import numpy as np
@@ -61,8 +62,8 @@ def fred_get(endpoint: str, params: dict) -> requests.Response:
 #  Pull CPI observations (Monthly, percent change YoY)
 # ------------------------------------------------------------------
 cpi_series_id = "CPIAUCSL"
-start_date = "2000-01-01"
-end_date   = "2025-08-31"
+start_date = "1990-01-01"
+end_date   = datetime.today().strftime("%Y-%m-%d")
 
 cpi_params = {
     "series_id": cpi_series_id,
@@ -137,28 +138,55 @@ print(f"\nLinear regression result: Unemp = {a:.3f} + {b:.3f} * CPI YoY%")
 
 
 # ------------------------------------------------------------------
-#  Plot the two series and the fitted line
+#  Plot the two series and the fitted line – with time‑based colour coding
 # ------------------------------------------------------------------
 plt.figure(figsize=(12, 6))
 
-# Scatter plot of actual data
-plt.scatter(merged_df["CPI YoY %"], merged_df["Unemployment %"],
-            color="steelblue", alpha=0.7, label="Observed")
+# --- Colour‑coded scatter plot ------------------------------------
+scatter = plt.scatter(
+    merged_df["CPI YoY %"],
+    merged_df["Unemployment %"],
+    c=merged_df.index,          # colour by date
+    cmap="Blues",               # <-- remove the '_r' to reverse the legend
+    alpha=0.7,
+    edgecolors='black',         # outline colour
+    linewidths=0.5,             # outline width
+    label="Observed"
+)
 
-# Regression line
-x_vals = np.linspace(merged_df["CPI YoY %"].min(),
-                     merged_df["CPI YoY %"].max(), 200)
+# --- Colour bar that shows the mapping from colour → *actual* dates ---
+cbar = plt.colorbar(scatter)
+cbar.ax.set_ylabel("Date", rotation=-90, va="bottom")
+
+def format_date_tick(value, pos=None):
+    dt = pd.to_datetime(value)
+    return dt.strftime("%b %Y")          # e.g. "Jan 2000"
+
+cbar.formatter = plt.FuncFormatter(format_date_tick)
+cbar.update_ticks()
+cbar.ax.tick_params(labelsize=8)
+
+# --- Regression line ---------------------------------------------
+x_vals = np.linspace(
+    merged_df["CPI YoY %"].min(),
+    merged_df["CPI YoY %"].max(),
+    200
+)
 y_pred = reg.predict(x_vals.reshape(-1, 1))
-plt.plot(x_vals, y_pred,
-         color="darkorange", linewidth=2,
-         label=f"Fit: Unemp = {a:.3f} + {b:.3f}·CPI")
 
-# Formatting
+plt.plot(
+    x_vals,
+    y_pred,
+    color="darkorange",
+    linewidth=2,
+    label=f"Fit: Unemp = {a:.3f} + {b:.3f}·CPI"
+)
+
+# --- Formatting ---------------------------------------------------
 plt.title("Unemployment vs. CPI (YoY %) – Linear Regression")
 plt.xlabel("CPI YoY %")
 plt.ylabel("Unemployment %")
 plt.legend()
 plt.grid(alpha=0.4)
 
-# Show the plot in a window; comment out if running headless
 plt.show()

@@ -82,7 +82,7 @@ series_specs = [
     ("MDSP"   ,  "q", "lin", "F_C_MDSP"),              # Mortgage DS Rate
     ("CDSP"   ,  "q", "lin", "F_C_CDSP"),              # Consumer DS Rate
     ("IITTRHB",  "a", "lin", "F_C_HTB"),               # Highest Tax Bracket %
- #   ("WFRBST01134","a","lin","F_C_OSNW")               # Top 1% Share of Net Worth
+#    ("WFRBST01134","a","lin","F_C_OSNW")               # Top 1% Share of Net Worth - data type issue
 ]
 
 # Store DataFrames in a dict keyed by table name for later upload
