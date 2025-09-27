@@ -6,14 +6,14 @@ Connect to a local/remote SQL Server instance using Windows Authentication.
 import pyodbc
 
 # ------------------------------------------------------------------
-# 1️⃣  Connection details – replace only the server and database names.
+# Connection details – replace only the server and database names.
 #     The rest (UID / PWD) is *not* needed when you use a trusted connection.
 # ------------------------------------------------------------------
 server   = r'Don_PC\SQLEXPRESS'   # note: raw string or double backslash
 database = 'Main'
 
 # ------------------------------------------------------------------
-# 2️⃣  Build the ODBC connection string.
+# Build the ODBC connection string.
 #
 #     - DRIVER          : The ODBC driver for SQL Server (change if you have a different one).
 #     - SERVER          : Name of the instance, e.g. "MyServer\SQLEXPRESS".
@@ -28,11 +28,11 @@ conn_str = (
 )
 
 # ------------------------------------------------------------------
-# 3️⃣  Try the connection and run a simple query.
+# Try the connection and run a simple query.
 # ------------------------------------------------------------------
 try:
     conn = pyodbc.connect(conn_str)
-    print("✅ Connection successful!")
+    print("Connection successful!")
 
     cursor = conn.cursor()
     cursor.execute("SELECT @@VERSION;")

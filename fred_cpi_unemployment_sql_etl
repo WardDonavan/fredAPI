@@ -1,0 +1,202 @@
+# -*- coding: utf-8 -*-
+"""
+Connect to a local/remote SQL Server instance using Windows Authentication,
+fetch FRED CPI & Unemployment data into DataFrames, then:
+- If target tables exist: TRUNCATE and insert
+- If not: create schema/table and insert
+"""
+
+import pyodbc
+import requests
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+import matplotlib.pyplot as plt
+
+# ------------------------------------------------------------------
+# Connection details – replace only the server and database names.
+# ------------------------------------------------------------------
+server   = r'Don_PC\SQLEXPRESS'
+database = 'Main'
+
+# ------------------------------------------------------------------
+# ODBC connection string (Windows auth)
+# ------------------------------------------------------------------
+conn_str = (
+    r'DRIVER={ODBC Driver 17 for SQL Server};'
+    f'SERVER={server};'
+    f'DATABASE={database};'
+    'Trusted_Connection=yes;'
+)
+
+# ------------------------------------------------------------------
+#  API key – make sure fred_key.py exists with: fred_key = "YOUR_KEY"
+# ------------------------------------------------------------------
+try:
+    from fred_key import fred_key
+except ImportError as exc:
+    raise RuntimeError(
+        "Could not import your FRED key.\n"
+        "Create a file called `fred_key.py` with:\n\n"
+        "    fred_key = \"YOUR_ACTUAL_KEY\""
+    ) from exc
+
+# ------------------------------------------------------------------
+#  Helper: FRED GET wrapper
+# ------------------------------------------------------------------
+BASE_URL = "https://api.stlouisfed.org/fred/"
+
+def fred_get(endpoint: str, params: dict) -> requests.Response:
+    url = BASE_URL + endpoint
+    params.setdefault("api_key", fred_key)
+    resp = requests.get(url, params=params)
+    resp.raise_for_status()
+    return resp
+
+# ------------------------------------------------------------------
+#  Pull CPI observations (Monthly, percent change YoY)
+# ------------------------------------------------------------------
+cpi_series_id = "CPIAUCSL"
+start_date = "2000-01-01"
+end_date   = "2025-08-31"
+
+cpi_params = {
+    "series_id": cpi_series_id,
+    "observation_start": start_date,
+    "observation_end": end_date,
+    "frequency": "m",
+    "units": "pc1",          # percent change YoY
+    "file_type": "json",
+}
+
+cpi_resp   = fred_get("series/observations", cpi_params)
+cpi_df     = pd.DataFrame(cpi_resp.json()["observations"])
+cpi_df["date"] = pd.to_datetime(cpi_df["date"])
+cpi_df.set_index("date", inplace=True)
+cpi_df["value"] = cpi_df["value"].astype(float)
+
+print("\n CPI observations YoY% (first 5 rows):")
+print(cpi_df.head())
+
+# ------------------------------------------------------------------
+#  Pull Unemployment Rate observations (Monthly, linear %)
+# ------------------------------------------------------------------
+unemp_series_id = "UNRATE"
+
+unemp_params = {
+    "series_id": unemp_series_id,
+    "observation_start": start_date,
+    "observation_end": end_date,
+    "frequency": "m",
+    "units": "lin",          # linear percent
+    "file_type": "json",
+}
+
+unemp_resp   = fred_get("series/observations", unemp_params)
+unemp_df     = pd.DataFrame(unemp_resp.json()["observations"])
+unemp_df["date"] = pd.to_datetime(unemp_df["date"])
+unemp_df.set_index("date", inplace=True)
+unemp_df["value"] = unemp_df["value"].astype(float)
+
+print("\n Unemployment % observations (first 5 rows):")
+print(unemp_df.head())
+
+# ------------------------------------------------------------------
+#  Load to SQL Server: check-exists → truncate/insert OR create/insert
+# ------------------------------------------------------------------
+
+TABLE_CPI   = "fred.F_C_CPI_YoY"
+TABLE_UNEMP = "fred.F_C_UNEMP"
+
+def _parse_schema_table(fully_qualified: str):
+    if '.' in fully_qualified:
+        schema, table = fully_qualified.split('.', 1)
+    else:
+        schema, table = 'fred', fully_qualified
+    return schema, table
+
+def schema_exists(cursor, schema: str) -> bool:
+    cursor.execute("SELECT 1 FROM sys.schemas WHERE name = ?", (schema,))
+    return cursor.fetchone() is not None
+
+def table_exists(cursor, schema: str, table: str) -> bool:
+    cursor.execute("""
+        SELECT 1
+        FROM sys.tables t
+        JOIN sys.schemas s ON t.schema_id = s.schema_id
+        WHERE t.name = ? AND s.name = ?
+    """, (table, schema))
+    return cursor.fetchone() is not None
+
+def create_schema_if_needed(cursor, schema: str):
+    if not schema_exists(cursor, schema):
+        cursor.execute(f"EXEC('CREATE SCHEMA {schema}')")
+
+def create_table(cursor, schema: str, table: str):
+    # Simple shape: [date] DATE PK, [value] FLOAT
+    cursor.execute(f"""
+        EXEC('CREATE TABLE {schema}.{table} (
+            [date]  DATE  NOT NULL PRIMARY KEY,
+            [value] FLOAT NULL
+        )')
+    """)
+
+def truncate_table(cursor, schema: str, table: str):
+    try:
+        cursor.execute(f"TRUNCATE TABLE {schema}.{table};")
+    except pyodbc.Error:
+        # Fallback if TRUNCATE blocked by FKs, permissions, etc.
+        cursor.execute(f"DELETE FROM {schema}.{table};")
+
+def insert_dataframe(cursor, schema: str, table: str, df: pd.DataFrame):
+    rows = [(idx.date(), float(val)) for idx, val in df["value"].items()]
+    cursor.fast_executemany = True
+    cursor.executemany(
+        f"INSERT INTO {schema}.{table} ([date],[value]) VALUES (?,?)",
+        rows
+    )
+
+def upsert_table_from_df(cursor, fully_qualified: str, df: pd.DataFrame):
+    schema, table = _parse_schema_table(fully_qualified)
+    create_schema_if_needed(cursor, schema)
+
+    if table_exists(cursor, schema, table):
+        truncate_table(cursor, schema, table)
+    else:
+        create_table(cursor, schema, table)
+
+    insert_dataframe(cursor, schema, table, df)
+
+# Connect and load
+conn = None
+try:
+    conn = pyodbc.connect(conn_str, autocommit=False)
+    print("Connection successful!")
+
+    with conn.cursor() as cur:
+        upsert_table_from_df(cur, TABLE_CPI,   cpi_df)
+        upsert_table_from_df(cur, TABLE_UNEMP, unemp_df)
+
+    conn.commit()
+    print(f"Upserted {len(cpi_df)} rows into {TABLE_CPI}")
+    print(f"Upserted {len(unemp_df)} rows into {TABLE_UNEMP}")
+
+    # Optional verification
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT TOP (5) [date],[value] FROM {TABLE_CPI} ORDER BY [date];")
+        print("\nSample from CPI table:")
+        for r in cur.fetchall():
+            print(r)
+
+        cur.execute(f"SELECT TOP (5) [date],[value] FROM {TABLE_UNEMP} ORDER BY [date];")
+        print("\nSample from Unemployment table:")
+        for r in cur.fetchall():
+            print(r)
+
+except Exception:
+    if conn:
+        conn.rollback()
+    raise
+finally:
+    if conn:
+        conn.close()
