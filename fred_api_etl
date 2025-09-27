@@ -1,0 +1,206 @@
+# -*- coding: utf-8 -*-
+"""
+Connect to a local/remote SQL Server instance using Windows Authentication,
+fetch FRED CPI & Unemployment (and several other series) into DataFrames,
+then:
+- If target tables exist → TRUNCATE and insert
+- If not → create schema/table and insert
+"""
+
+import pyodbc
+import requests
+import pandas as pd
+from datetime import datetime
+
+# ------------------------------------------------------------------
+# Connection details – replace only the server and database names.
+# ------------------------------------------------------------------
+server   = r'Don_PC\SQLEXPRESS'
+database = 'Main'
+
+# ------------------------------------------------------------------
+# ODBC connection string (Windows auth)
+# ------------------------------------------------------------------
+conn_str = (
+    r'DRIVER={ODBC Driver 17 for SQL Server};'
+    f'SERVER={server};'
+    f'DATABASE={database};'
+    'Trusted_Connection=yes;'
+)
+
+# ------------------------------------------------------------------
+# Pull the FRED API key from SQL Server
+# ------------------------------------------------------------------
+def _get_fred_api_key() -> str:
+    """
+    Reads Main.fred.LKP_API_KEY.api and returns it as a string.
+    Raises RuntimeError if the key cannot be found or read.
+    """
+    try:
+        with pyodbc.connect(conn_str) as cnxn:
+            cursor = cnxn.cursor()
+            cursor.execute("""
+                SELECT TOP 1 api
+                FROM Main.fred.LKP_API_KEY
+            """)
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                raise RuntimeError(
+                    "No API key found in Main.fred.LKP_API_KEY.api"
+                )
+            return str(row[0]).strip()
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not retrieve the FRED API key from the database.\n"
+            f"Original exception: {exc}"
+        ) from exc
+
+fred_key = _get_fred_api_key()
+
+# ------------------------------------------------------------------
+# Helper: FRED GET wrapper
+# ------------------------------------------------------------------
+BASE_URL = "https://api.stlouisfed.org/fred/"
+
+def fred_get(endpoint: str, params: dict) -> requests.Response:
+    url = BASE_URL + endpoint
+    params.setdefault("api_key", fred_key)
+    resp = requests.get(url, params=params)
+    resp.raise_for_status()
+    return resp
+
+# ------------------------------------------------------------------
+# Pull series (CPI, Unemployment, DSR, MDSP, CDSP, HTB, OSNW)
+# ------------------------------------------------------------------
+start_date = "1990-01-01"
+end_date   = datetime.today().strftime("%Y-%m-%d")
+
+series_specs = [
+    ("CPIAUCSL",  "m", "pc1", "F_C_CPI_YoY"),          # CPI YoY %
+    ("UNRATE"  ,  "m", "lin", "F_C_UNEMP"),            # Unemployment %
+    ("TDSP"   ,  "q", "lin", "F_C_DSR"),               # Debt Service Rate
+    ("MDSP"   ,  "q", "lin", "F_C_MDSP"),              # Mortgage DS Rate
+    ("CDSP"   ,  "q", "lin", "F_C_CDSP"),              # Consumer DS Rate
+    ("IITTRHB",  "a", "lin", "F_C_HTB"),               # Highest Tax Bracket %
+ #   ("WFRBST01134","a","lin","F_C_OSNW")               # Top 1% Share of Net Worth
+]
+
+# Store DataFrames in a dict keyed by table name for later upload
+dfs = {}
+
+for series_id, freq, units, tbl_suffix in series_specs:
+    params = {
+        "series_id": series_id,
+        "observation_start": start_date,
+        "observation_end": end_date,
+        "frequency": freq,
+        "units": units,
+        "file_type": "json",
+    }
+    resp   = fred_get("series/observations", params)
+    df     = pd.DataFrame(resp.json()["observations"])
+    df["date"] = pd.to_datetime(df["date"])
+    df.set_index("date", inplace=True)
+    # Some series return null for missing values – keep them as NaN
+    if "value" in df.columns:
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    else:
+        raise RuntimeError(f"No 'value' column returned for {series_id}")
+    print(f"\n{series_id} (first 5 rows):")
+    print(df.head())
+    dfs[f"fred.{tbl_suffix}"] = df
+
+# ------------------------------------------------------------------
+# Load to SQL Server: check‑exists → truncate/insert OR create/insert
+# ------------------------------------------------------------------
+def _parse_schema_table(fully_qualified: str):
+    if '.' in fully_qualified:
+        schema, table = fully_qualified.split('.', 1)
+    else:
+        schema, table = 'fred', fully_qualified
+    return schema.strip(), table.strip()
+
+def schema_exists(cursor, schema: str) -> bool:
+    cursor.execute("SELECT 1 FROM sys.schemas WHERE name = ?", (schema,))
+    return cursor.fetchone() is not None
+
+def table_exists(cursor, schema: str, table: str) -> bool:
+    cursor.execute("""
+        SELECT 1
+        FROM sys.tables t
+        JOIN sys.schemas s ON t.schema_id = s.schema_id
+        WHERE t.name = ? AND s.name = ?
+    """, (table, schema))
+    return cursor.fetchone() is not None
+
+def create_schema_if_needed(cursor, schema: str):
+    if not schema_exists(cursor, schema):
+        cursor.execute(f"EXEC('CREATE SCHEMA [{schema}]')")
+
+def create_table(cursor, schema: str, table: str):
+    cursor.execute(f"""
+        EXEC('CREATE TABLE [{schema}].[{table}] (
+            [date]  DATE NOT NULL PRIMARY KEY,
+            [value] FLOAT NULL
+        )')
+    """)
+
+def truncate_table(cursor, schema: str, table: str):
+    try:
+        cursor.execute(f"TRUNCATE TABLE [{schema}].[{table}];")
+    except pyodbc.Error:
+        cursor.execute(f"DELETE FROM [{schema}].[{table}];")
+
+def insert_dataframe(cursor, schema: str, table: str, df: pd.DataFrame):
+    rows = [(idx.date(), float(val)) for idx, val in df["value"].items()]
+    cursor.fast_executemany = True
+    cursor.executemany(
+        f"INSERT INTO [{schema}].[{table}] ([date],[value]) VALUES (?,?)",
+        rows
+    )
+
+def upsert_table_from_df(cursor, fully_qualified: str, df: pd.DataFrame):
+    schema, table = _parse_schema_table(fully_qualified)
+    create_schema_if_needed(cursor, schema)
+
+    if table_exists(cursor, schema, table):
+        truncate_table(cursor, schema, table)
+    else:
+        create_table(cursor, schema, table)
+
+    insert_dataframe(cursor, schema, table, df)
+
+# ------------------------------------------------------------------
+# Connect and load
+# ------------------------------------------------------------------
+conn = None
+try:
+    conn = pyodbc.connect(conn_str, autocommit=False)
+    print("Connection successful!")
+
+    with conn.cursor() as cur:
+        for fq_table, df in dfs.items():
+            upsert_table_from_df(cur, fq_table, df)
+
+    conn.commit()
+    for fq_table, df in dfs.items():
+        print(f"Upserted {len(df)} rows into {fq_table}")
+
+    # Optional verification – show the first 5 rows of each table
+    with conn.cursor() as cur:
+        for fq_table in dfs.keys():
+            schema, table = _parse_schema_table(fq_table)
+            cur.execute(
+                f"SELECT TOP (5) [date],[value] FROM [{schema}].[{table}] ORDER BY [date];"
+            )
+            print(f"\nSample from {fq_table}:")
+            for r in cur.fetchall():
+                print(r)
+
+except Exception as exc:
+    if conn:
+        conn.rollback()
+    raise RuntimeError("An error occurred while loading data") from exc
+finally:
+    if conn:
+        conn.close()
